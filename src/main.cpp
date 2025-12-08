@@ -57,16 +57,24 @@ SOFTWARE.
 // until this is solved.
 
 #include <Arduino.h>
+
+#include "pico/multicore.h"
+#include "pico/util/queue.h"
+
 #include "kvm.h"
 #include "CH9329.h"
 CH9329 *CH9329Client;
 
 #include "FreeRTOS.h" // 包含 FreeRTOS 头文件
-#include "semphr.h"   // 包含信号量和互斥锁相关的头文件
+// #include "semphr.h"   // 包含信号量和互斥锁相关的头文件
 #include <task.h>
-SemaphoreHandle_t ch9329_mutex; // 声明一个互斥锁句柄
+// SemaphoreHandle_t ch9329_mutex; // 声明一个互斥锁句柄
 // 定义发送字符的任务句柄
 TaskHandle_t Serial2SendGetInfoTaskHandle = NULL;
+TaskHandle_t BootSelTaskHandle = NULL;
+
+// This is the inter-task queue
+volatile QueueHandle_t queue = nullptr;
 
 struct CH9329CFG ch9329cfgs[CH9329COUNT] = {
     {
@@ -78,7 +86,7 @@ struct CH9329CFG ch9329cfgs[CH9329COUNT] = {
         .addr = 0x30,
         .baud = 115200,
         .CFG1 = HIGH,
-        .MODE1 = LOW // LOW: 注：Linux/Android/macOS等操作系统下，建议使用该模式。
+        .MODE1 = HIGH // LOW: 注：Linux/Android/macOS等操作系统下，建议使用该模式。
     },
     {
         .led_pin = 28,
@@ -89,10 +97,22 @@ struct CH9329CFG ch9329cfgs[CH9329COUNT] = {
         .addr = 0x01,
         .baud = 115200,
         .CFG1 = HIGH,
-        .MODE1 = LOW // LOW: 注：Linux/Android/macOS等操作系统下，建议使用该模式。
+        .MODE1 = HIGH // LOW: 注：Linux/Android/macOS等操作系统下，建议使用该模式。
     }};
 
-//#define USB_DEBUG 1
+// 定义通信结构体
+typedef struct TU_ATTR_PACKED
+{
+  uint8_t type;    // 0: mouse, 1: keyboard
+  uint8_t data[8]; // HID report data (根据需要调整大小)
+} hid_report_t;
+// 使用队列进行安全通信
+// 鼠标/键盘报告从 Core 1 发送到 Core 0
+queue_t report_queue;
+// 指令从 Core 0 发送到 Core 1
+queue_t command_queue;
+
+#define USB_DEBUG 1
 
 // pio-usb is required for rp2040 host
 #include "pio_usb.h"
@@ -102,198 +122,229 @@ struct CH9329CFG ch9329cfgs[CH9329COUNT] = {
 // USB Host object
 Adafruit_USBH_Host USBHost;
 
-bool Skip_report_id = false;
+static void process_kbd_report(hid_keyboard_report_t const *report)
+{
+  static hid_keyboard_report_t prev_report = {0, 0, {0}};
+  CH9329Client->press(current_status.active_screen,
+                      report->modifier,
+                      report->keycode[0],
+                      report->keycode[1],
+                      report->keycode[2],
+                      report->keycode[3],
+                      report->keycode[4],
+                      report->keycode[5]
 
-// Invoked when device with hid interface is mounted
-// Report descriptor is also available for use.
-// tuh_hid_parse_report_descriptor() can be used to parse common/simple enough
-// descriptor. Note: if report descriptor length > CFG_TUH_ENUMERATION_BUFSIZE,
-// it will be skipped therefore report_desc = NULL, desc_len = 0
+  );
+
+  prev_report = *report;
+}
+
+static void process_mouse_report(hid_mouse_report_t const *report)
+{
+  static hid_mouse_report_t prev_report = {0};
+
+  judge_kvm_mode(CH9329Client->isUSBConnected(0),
+                 CH9329Client->isUSBConnected(1),
+                 report->x, report->y);
+  switch (current_status.mode)
+  {
+  case KVM_MODE_LEFT_ONLY:
+  case KVM_MODE_RIGHT_ONLY:
+    CH9329Client->turnOffLed(!current_status.active_screen);
+    CH9329Client->mouseMove(current_status.active_screen, report->x, report->y, report->buttons, report->wheel);
+    break;
+  case KVM_MODE_ON_LEFT:
+  case KVM_MODE_ON_RIGHT:
+    CH9329Client->turnOffLed(!current_status.active_screen);
+    CH9329Client->mouseMoveAbs(current_status.active_screen,
+                               convert_to_abs_pos_x(current_status.current_mouse_x),
+                               convert_to_abs_pos_y(current_status.current_mouse_y),
+                               report->buttons,
+                               report->wheel);
+    // CH9329 click and wheel are not working under linux and android.
+    CH9329Client->mouseMove(current_status.active_screen,
+                            0,
+                            0,
+                            report->buttons,
+                            report->wheel);
+    break;
+  default:
+    break;
+  }
+#if USB_DEBUG && 0
+  // Mouse position.
+  DBG_printf("Mouse: (%d %d %d)", report->x, report->y, report->wheel);
+
+  // Button state.
+  uint8_t button_changed_mask = report->buttons ^ prev_report.buttons;
+  if (button_changed_mask & report->buttons)
+  {
+    DBG_printf(" %c%c%c",
+               report->buttons & MOUSE_BUTTON_LEFT ? 'L' : '-',
+               report->buttons & MOUSE_BUTTON_MIDDLE ? 'M' : '-',
+               report->buttons & MOUSE_BUTTON_RIGHT ? 'R' : '-');
+  }
+
+  DBG_printf("\n");
+#endif
+  prev_report = *report;
+}
+// tuh_hid_mount_cb is executed when a new device is mounted.
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_report, uint16_t desc_len)
 {
-  (void)desc_report;
-  (void)desc_len;
-  uint16_t vid, pid;
-  tuh_vid_pid_get(dev_addr, &vid, &pid);
-
-  DBG_printf("HID device address = %d, instance = %d is mounted\r\n", dev_addr, instance);
-  DBG_printf("VID = %04x, PID = %04x\r\n", vid, pid);
-  uint8_t const protocol_mode = tuh_hid_get_protocol(dev_addr, instance);
   uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, instance);
-  DBG_printf("protocol_mode=%d,itf_protocol=%d\r\n",
-             protocol_mode, itf_protocol);
-
-  const size_t REPORT_INFO_MAX = 8;
-  tuh_hid_report_info_t report_info[REPORT_INFO_MAX];
-  uint8_t report_num = tuh_hid_parse_report_descriptor(report_info,
-                                                       REPORT_INFO_MAX, desc_report, desc_len);
-  DBG_printf("HID descriptor reports:%d\r\n", report_num);
-  bool hid_mouse = false;
-  for (size_t i = 0; i < report_num; i++)
+  if (itf_protocol == HID_ITF_PROTOCOL_NONE)
   {
-    DBG_printf("%d,%d,%d\r\n", report_info[i].report_id, report_info[i].usage,
-               report_info[i].usage_page);
-    Skip_report_id = false;
-    if ((report_info[i].usage_page == 1) && (report_info[i].usage == 2))
-    {
-      hid_mouse = true;
-      if (itf_protocol == HID_ITF_PROTOCOL_NONE)
-        Skip_report_id = report_info[i].report_id != 0;
-      else if (protocol_mode == HID_PROTOCOL_BOOT)
-        Skip_report_id = false;
-      else
-        Skip_report_id = report_info[i].report_id != 0;
-      break;
-    }
+    DBG_printf("Device with address %d, instance %d is not a keyboard or mouse.\r\n", dev_addr, instance);
+    return;
+  }
+  if (itf_protocol == HID_ITF_PROTOCOL_KEYBOARD)
+  {
+    addKeyboard(dev_addr, instance);
   }
 
-  if (desc_report && desc_len)
+  for (size_t i = 0; i < CH9329COUNT; i++)
   {
-    for (size_t i = 0; i < desc_len; i++)
-    {
-      DBG_printf("%x,", desc_report[i]);
-    }
-    DBG_println();
+    CH9329Client->releaseAll(i);
+    CH9329Client->mouseRelease(i);
   }
+  const char *protocol_str[] = {"None", "Keyboard", "Mouse"};
+  DBG_printf("Device with address %d, instance %d is a %s.\r\n", dev_addr, instance, protocol_str[itf_protocol]);
 
-  if ((itf_protocol == HID_ITF_PROTOCOL_MOUSE) || hid_mouse)
-  {
-    DBG_println("HID Mouse");
-    if (!tuh_hid_receive_report(dev_addr, instance))
-    {
-      DBG_println("Error: cannot request to receive report");
-    }
-  }
-}
-
-// Invoked when device with hid interface is un-mounted
-void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
-{
-  DBG_printf("HID device address = %d, instance = %d is unmounted\r\n", dev_addr, instance);
-}
-
-// Invoked when received report from device via interrupt endpoint
-void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance,
-                                uint8_t const *report, uint16_t len)
-{
-  if (Skip_report_id)
-  {
-    // Skip first byte which is report ID.
-    report++;
-    len--;
-  }
-  if (len > 2)
-  {
-    hid_mouse_report_t mouseRpt = {0};
-    mouseRpt.buttons = report[0];
-    mouseRpt.x = report[1];
-    mouseRpt.y = report[2];
-    if (len > 3)
-    {
-      mouseRpt.wheel = report[3];
-      if (len > 4)
-      {
-        mouseRpt.pan = report[4];
-      }
-    }
-    // DBG_printf("mouse moved to x=%d, y=%d\r\n", mouseRpt.x, mouseRpt.y);
-
-    judge_kvm_mode(CH9329Client->isUSBConnected(0),
-                   CH9329Client->isUSBConnected(1),
-                   mouseRpt.x, mouseRpt.y);
-    // 使用互斥锁保护 mouseMove 调用
-    if (xSemaphoreTake(ch9329_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
-    { // 设置10ms超时
-      switch (current_status.mode)
-      {
-      case KVM_MODE_NONE:
-        CH9329Client->turnOffLed(0);
-        CH9329Client->turnOffLed(1);
-        /* code */
-        break;
-      case KVM_MODE_LEFT_ONLY:
-      case KVM_MODE_RIGHT_ONLY:
-        CH9329Client->turnOnLed(current_status.active_screen);
-        CH9329Client->turnOffLed(!current_status.active_screen);
-        CH9329Client->mouseMove(current_status.active_screen, mouseRpt.x, mouseRpt.y, mouseRpt.buttons, mouseRpt.wheel);
-        break;
-      case KVM_MODE_ON_LEFT:
-      case KVM_MODE_ON_RIGHT:
-        CH9329Client->turnOnLed(current_status.active_screen);
-        CH9329Client->turnOffLed(!current_status.active_screen);
-        CH9329Client->mouseMoveAbs(current_status.active_screen,
-                                   convert_to_abs_pos_x(current_status.current_mouse_x),
-                                   convert_to_abs_pos_y(current_status.current_mouse_y),
-                                   mouseRpt.buttons,
-                                   mouseRpt.wheel);
-        CH9329Client->mousePress(current_status.active_screen, mouseRpt.buttons);
-        CH9329Client->mouseWheel(current_status.active_screen, mouseRpt.wheel);
-        break;
-      default:
-        break;
-      }
-      xSemaphoreGive(ch9329_mutex);
-    }
-    
-  }
-  else
-  {
-    static uint32_t drops = 0;
-    DBG_printf("drops=%lu\r\n", ++drops);
-  }
-
-  // continue to request to receive report
+  // request to receive report
+  // tuh_hid_report_received_cb() will be invoked when report is available
   if (!tuh_hid_receive_report(dev_addr, instance))
   {
-    DBG_println("Error: cannot request to receive report");
+    DBG_printf("Error: cannot request to receive report\r\n");
   }
 }
 
+// tuh_hid_report_received_cb is executed when data is received from the keyboard or mouse.
+void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *report, uint16_t len)
+{
+  uint8_t type = tuh_hid_interface_protocol(dev_addr, instance);
+
+  // 打印接收到的数据长度和类型
+  DBG_printf("Received Report: Type=%02X, Length=%u\r\n", type, len);
+
+  // 2. 打印原始报告数据的前几个字节，排除 memcpy 的错误
+  DBG_printf("Data: ");
+  for (uint16_t i = 0; i < len && i < 16; i++)
+  { // 限制最多打印16个字节
+    DBG_printf("%02X ", report[i]);
+  }
+  DBG_printf("\r\n");
+
+  hid_report_t new_report;
+  new_report.type = type;
+  memcpy(new_report.data, report, len);
+
+  queue_try_add(&report_queue, &new_report);
+
+  // request to receive next report
+  // tuh_hid_report_received_cb() will be invoked when report is available
+  if (!tuh_hid_receive_report(dev_addr, instance))
+  {
+    DBG_printf("Error: cannot request to receive report\r\n");
+  }
+}
+
+// tuh_hid_umount_cb is executed when a device is unmounted.
+void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
+{
+  removeKeyboard(dev_addr, instance);
+  for (size_t i = 0; i < CH9329COUNT; i++)
+  {
+    CH9329Client->releaseAll(i);
+    CH9329Client->mouseRelease(i);
+  }
+  DBG_printf("Device with address %d, instance %d was unmounted.\r\n", dev_addr, instance);
+}
+
+void kvm_change_keyboard_leds_cb(uint8_t index, uint8_t leds)
+{
+  static uint8_t new_led_value;
+  new_led_value = leds;
+  if (current_status.active_screen == index)
+  {
+    for (size_t i = 0; i < current_status.keyboardCount; i++)
+    {
+      tuh_hid_set_report(current_status.keyboardlist[i].dev_addr,
+                         current_status.keyboardlist[i].instance,
+                         0,
+                         HID_REPORT_TYPE_OUTPUT,
+                         &new_led_value,
+                         sizeof(leds));
+    }
+  }
+}
+
+void setBoardLEDs_cb(KVM_MODE mode)
+{
+  switch (mode)
+  {
+  case KVM_MODE_NONE:
+    CH9329Client->turnOffLed(0);
+    CH9329Client->turnOffLed(1);
+    break;
+  default:
+    CH9329Client->turnOnLed(current_status.active_screen);
+    break;
+  }
+}
+
+void mouseFromLeftToRight_cb()
+{
+  DBG_println("mouseFromLeftToRight_cb");
+  CH9329Client->mouseMoveAbs(SCREEN_LEFT,
+                             convert_to_abs_pos_x(MAX_SCREEN_WIDTH),
+                             convert_to_abs_pos_y(current_status.current_mouse_y),
+                             0, 0);
+}
+
+void mouseFromRightToLeft_cb()
+{
+  DBG_println("mouseFromRightToLeft_cb");
+  CH9329Client->mouseMoveAbs(SCREEN_RIGHT,
+                             0,
+                             convert_to_abs_pos_y(current_status.current_mouse_y),
+                             0, 0);
+}
+
+/**
+ * 任务函数: 每500ms向 Serial2 发送一个字符
+ */
+void BootSelTask(void *pvParameters)
+{
+  while (1)
+  {
+    if (BOOTSEL)
+    {
+      rp2040.rebootToBootloader();
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
 /**
  * 任务函数: 每500ms向 Serial2 发送一个字符
  */
 void Serial2SendGetInfoTask(void *pvParameters)
 {
   // 获取锁
-  if (xSemaphoreTake(ch9329_mutex, portMAX_DELAY) == pdTRUE)
+  for (int i = 0; i < CH9329COUNT; i++)
+  {
+    CH9329Client->cmdReset(i);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    DBG_printf("CH9329[%d] inited.\r\n", i);
+  }
+  // 释放锁
+  while (1)
   {
     for (int i = 0; i < CH9329COUNT; i++)
     {
-      CH9329Client->cmdReset(i);
-      vTaskDelay(pdMS_TO_TICKS(10));
-      DBG_printf("CH9329[%d] inited.\r\n", i);
+      CH9329Client->cmdGetInfo(i);
+      vTaskDelay(pdMS_TO_TICKS(500));
     }
-    // 释放锁
-    xSemaphoreGive(ch9329_mutex);
-  }
-  while (1)
-  {
-
-    // 获取锁
-    if (xSemaphoreTake(ch9329_mutex, portMAX_DELAY) == pdTRUE)
-    {
-      for (int i = 0; i < CH9329COUNT; i++)
-      {
-        CH9329Client->cmdGetInfo(i);
-        vTaskDelay(pdMS_TO_TICKS(20));
-        CH9329Client->readUart();
-      }
-      // 释放锁
-      xSemaphoreGive(ch9329_mutex);
-    }
-    // 延时 500 毫秒
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
-    // // 尝试获取互斥锁，等待无限长时间
-    // if (xSemaphoreTake(ch9329_mutex, portMAX_DELAY) == pdTRUE)
-    // {
-    //   // 成功获取锁，可以安全地访问 CH9329Client
-    //   CH9329Client->readUart();
-
-    //   // 操作完成后，必须释放互斥锁
-    //   xSemaphoreGive(ch9329_mutex);
-    // }
-    // vTaskDelay(pdMS_TO_TICKS(500));
   }
 }
 
@@ -306,29 +357,30 @@ void setup()
   Serial.begin(115200);
   DBG_println("Serial inited.");
 
-  // 创建一个互斥信号量
-  ch9329_mutex = xSemaphoreCreateMutex();
-  if (ch9329_mutex == NULL)
-  {
-    // 互斥锁创建失败，可能内存不足或系统错误
-    DBG_println("Error: Failed to create CH9329 mutex!");
-    while (1)
-      ; // 停止程序
-  }
+  // 初始化队列
+  queue_init(&report_queue, sizeof(hid_report_t), 100); // 100项容量
+  queue_init(&command_queue, sizeof(uint32_t), 5);      // 5项容量
 
   CH9329Client = new CH9329(&Serial2, ch9329cfgs);
+
   // 创建任务
-  // 参数: 任务函数, 任务名称, 堆栈大小, 传递给任务的参数,
-  // 任务优先级 (tskIDLE_PRIORITY + 1 是一个较低的优先级), 任务句柄
   xTaskCreate(
       Serial2SendGetInfoTask,
       "Serial2SendGetInfoTask",
+      2048, // 堆栈大小可以根据需要调整
+      NULL,
+      tskIDLE_PRIORITY + 2, // 低优先级
+      &Serial2SendGetInfoTaskHandle);
+
+  xTaskCreate(
+      BootSelTask,
+      "BootSelTask",
       1024, // 堆栈大小可以根据需要调整
       NULL,
       tskIDLE_PRIORITY + 1, // 低优先级
-      &Serial2SendGetInfoTaskHandle);
-
-  // CH9329Client->readUart();
+      &BootSelTaskHandle);
+  queue = xQueueCreate(2, sizeof(uint8_t));
+  vTaskStartScheduler();
   // wait until device mounted
   while (!USBDevice.mounted())
     delay(1);
@@ -337,6 +389,26 @@ void setup()
 
 void loop()
 {
+
+  // 尝试获取互斥锁，等待无限长时间
+  // 成功获取锁，可以安全地访问 CH9329Client
+  CH9329Client->readUart();
+
+  // 操作完成后，必须释放互斥锁
+
+  hid_report_t report;
+  if (queue_try_remove(&report_queue, &report))
+  {
+    switch (report.type)
+    {
+    case HID_ITF_PROTOCOL_KEYBOARD:
+      process_kbd_report((hid_keyboard_report_t const *)report.data);
+      break;
+    case HID_ITF_PROTOCOL_MOUSE:
+      process_mouse_report((hid_mouse_report_t const *)report.data);
+      break;
+    }
+  }
 }
 
 //--------------------------------------------------------------------+
@@ -380,7 +452,4 @@ void setup1()
 void loop1()
 {
   USBHost.task();
-  if(BOOTSEL){
-    rp2040.rebootToBootloader();
-  }
 }

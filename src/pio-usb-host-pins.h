@@ -13,3 +13,6 @@
 #ifndef PIN_PIO_USB_HOST_VBUSEN_STATE
 #define PIN_PIO_USB_HOST_VBUSEN_STATE 1
 #endif
+
+// 新增的第二个 Host 端口配置 (GPIO 14/15)
+#define PIN_PIO_USB_HOST_DP2          14

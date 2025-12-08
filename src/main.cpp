@@ -65,16 +65,12 @@ SOFTWARE.
 #include "CH9329.h"
 CH9329 *CH9329Client;
 
-#include "FreeRTOS.h" // 包含 FreeRTOS 头文件
-// #include "semphr.h"   // 包含信号量和互斥锁相关的头文件
-#include <task.h>
-// SemaphoreHandle_t ch9329_mutex; // 声明一个互斥锁句柄
-// 定义发送字符的任务句柄
-TaskHandle_t Serial2SendGetInfoTaskHandle = NULL;
-TaskHandle_t BootSelTaskHandle = NULL;
+// pio-usb is required for rp2040 host
+#include "pio_usb.h"
+#include "pio-usb-host-pins.h"
+#include "Adafruit_TinyUSB.h"
 
-// This is the inter-task queue
-volatile QueueHandle_t queue = nullptr;
+#define USB_DEBUG 1
 
 struct CH9329CFG ch9329cfgs[CH9329COUNT] = {
     {
@@ -106,21 +102,20 @@ typedef struct TU_ATTR_PACKED
   uint8_t type;    // 0: mouse, 1: keyboard
   uint8_t data[8]; // HID report data (根据需要调整大小)
 } hid_report_t;
+
 // 使用队列进行安全通信
 // 鼠标/键盘报告从 Core 1 发送到 Core 0
 queue_t report_queue;
-// 指令从 Core 0 发送到 Core 1
-queue_t command_queue;
-
-#define USB_DEBUG 1
-
-// pio-usb is required for rp2040 host
-#include "pio_usb.h"
-#include "pio-usb-host-pins.h"
-#include "Adafruit_TinyUSB.h"
 
 // USB Host object
 Adafruit_USBH_Host USBHost;
+// Generally, you should use "unsigned long" for variables that hold time
+// The value will quickly become too large for an int to store
+unsigned long previousMillis0 = 0;
+unsigned long previousMillis1 = 0;
+unsigned long previousMillis2 = 0;
+unsigned long previousMillis3 = 0;
+unsigned long currentMillis = 0;
 
 static void process_kbd_report(hid_keyboard_report_t const *report)
 {
@@ -311,91 +306,53 @@ void mouseFromRightToLeft_cb()
                              0, 0);
 }
 
-/**
- * 任务函数: 每500ms向 Serial2 发送一个字符
- */
-void BootSelTask(void *pvParameters)
+// 新增任务：LED 闪烁任务（中等优先级）
+void led_task()
 {
-  while (1)
-  {
-    if (BOOTSEL)
-    {
-      rp2040.rebootToBootloader();
-    }
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
+  gpio_xor_mask(1U << LED_BUILTIN); // LED 开关
 }
 /**
  * 任务函数: 每500ms向 Serial2 发送一个字符
  */
-void Serial2SendGetInfoTask(void *pvParameters)
+void BootSelTask()
 {
-  // 获取锁
+  if (BOOTSEL)
+  {
+    rp2040.rebootToBootloader();
+  }
+}
+void resetCH9329Task()
+{
   for (int i = 0; i < CH9329COUNT; i++)
   {
     CH9329Client->cmdReset(i);
-    vTaskDelay(pdMS_TO_TICKS(10));
+    delay(10);
     DBG_printf("CH9329[%d] inited.\r\n", i);
   }
-  // 释放锁
-  while (1)
+}
+/**
+ * 任务函数: 每500ms向 Serial2 发送一个字符
+ */
+void Serial2SendGetInfoTask()
+{
+  for (int i = 0; i < CH9329COUNT; i++)
   {
-    for (int i = 0; i < CH9329COUNT; i++)
-    {
-      CH9329Client->cmdGetInfo(i);
-      vTaskDelay(pdMS_TO_TICKS(500));
-    }
+    CH9329Client->cmdGetInfo(i);
+    delay(20);
   }
 }
-
-//--------------------------------------------------------------------+
-// Setup and Loop on Core0
-//--------------------------------------------------------------------+
-
-void setup()
+/**
+ * 任务函数: Serial2读取
+ */
+void ReadSerialTask()
 {
-  Serial.begin(115200);
-  DBG_println("Serial inited.");
-
-  // 初始化队列
-  queue_init(&report_queue, sizeof(hid_report_t), 100); // 100项容量
-  queue_init(&command_queue, sizeof(uint32_t), 5);      // 5项容量
-
-  CH9329Client = new CH9329(&Serial2, ch9329cfgs);
-
-  // 创建任务
-  xTaskCreate(
-      Serial2SendGetInfoTask,
-      "Serial2SendGetInfoTask",
-      2048, // 堆栈大小可以根据需要调整
-      NULL,
-      tskIDLE_PRIORITY + 2, // 低优先级
-      &Serial2SendGetInfoTaskHandle);
-
-  xTaskCreate(
-      BootSelTask,
-      "BootSelTask",
-      1024, // 堆栈大小可以根据需要调整
-      NULL,
-      tskIDLE_PRIORITY + 1, // 低优先级
-      &BootSelTaskHandle);
-  queue = xQueueCreate(2, sizeof(uint8_t));
-  vTaskStartScheduler();
-  // wait until device mounted
-  while (!USBDevice.mounted())
-    delay(1);
-  DBG_println("USB Boot Mouse pass through");
-}
-
-void loop()
-{
-
-  // 尝试获取互斥锁，等待无限长时间
-  // 成功获取锁，可以安全地访问 CH9329Client
   CH9329Client->readUart();
-
-  // 操作完成后，必须释放互斥锁
-
+}
+/**
+ * 任务函数: Serial2写入
+ */
+void Core0SendSerialTask()
+{
   hid_report_t report;
   if (queue_try_remove(&report_queue, &report))
   {
@@ -411,14 +368,45 @@ void loop()
   }
 }
 
-//--------------------------------------------------------------------+
-// Setup and Loop on Core1
-//--------------------------------------------------------------------+
-
+/**
+ * 任务函数: Core1USBInitTask
+ */
 void setup1()
 {
   delay(3000);
   DBG_println("Core1 setup to run TinyUSB host with pio-usb");
+  Serial.flush();
+
+  pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+  pio_cfg.pin_dp = PIN_PIO_USB_HOST_DP;
+  USBHost.configure_pio_usb(1, &pio_cfg);
+
+  // --- 配置第二个 Host 端口 (RHPort 2, GPIO 14/15) ---
+  // 配置 USB 主机库的根端口 2
+  // pio_usb_configuration_t pio_cfg_2 = PIO_USB_DEFAULT_CONFIG;
+  // pio_cfg_2.pin_dp = PIN_PIO_USB_HOST_DP2;
+
+  // USBHost.configure_pio_usb(2, &pio_cfg_2);
+  pio_usb_host_add_port(PIN_PIO_USB_HOST_DP2, PIO_USB_PINOUT_DPDM);
+
+  // run host stack on controller (rhport) 1
+  // Note: For rp2040 pico-pio-usb, calling USBHost.begin() on core1 will have most of the
+  // host bit-banging processing works done in core1 to free up core0 for other works
+  USBHost.begin(1);
+}
+
+//--------------------------------------------------------------------+
+// Setup and Loop on Core0
+//--------------------------------------------------------------------+
+void setup()
+{
+  Serial.begin(115200);
+#if USB_DEBUG
+  while (!Serial)
+    delay(10); // wait for native usb
+#endif
+  DBG_println("Serial inited.");
+  Serial.flush();
 
   // Check for CPU frequency, must be multiple of 120Mhz for bit-banging USB
   uint32_t cpu_hz = clock_get_hz(clk_sys);
@@ -434,21 +422,45 @@ void setup1()
       delay(1);
   }
 
-#ifdef PIN_PIO_USB_HOST_VBUSEN
-  pinMode(PIN_PIO_USB_HOST_VBUSEN, OUTPUT);
-  digitalWrite(PIN_PIO_USB_HOST_VBUSEN, PIN_PIO_USB_HOST_VBUSEN_STATE);
-#endif
+  gpio_init(LED_BUILTIN);
+  gpio_set_dir(LED_BUILTIN, GPIO_OUT);
 
-  pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-  pio_cfg.pin_dp = PIN_PIO_USB_HOST_DP;
-  USBHost.configure_pio_usb(1, &pio_cfg);
+  // 初始化队列
+  queue_init(&report_queue, sizeof(hid_report_t), 50); // 100项容量
+  DBG_println("Queue inited.");
+  Serial.flush();
 
-  // run host stack on controller (rhport) 1
-  // Note: For rp2040 pico-pio-usb, calling USBHost.begin() on core1 will have most of the
-  // host bit-banging processing works done in core1 to free up core0 for other works
-  USBHost.begin(1);
+  CH9329Client = new CH9329(&Serial2, ch9329cfgs);
+  DBG_println("CH9329Client inited.");
+  Serial.flush();
+
+  resetCH9329Task();
+  DBG_println("CH9329Client reseted.");
+  Serial.flush();
 }
 
+void loop()
+{
+  currentMillis = millis();
+  Core0SendSerialTask();
+
+  if (currentMillis - previousMillis1 >= 50)
+  {
+    ReadSerialTask();
+    previousMillis1 = currentMillis;
+  }
+  if (currentMillis - previousMillis0 >= 500)
+  {
+    Serial2SendGetInfoTask();
+    led_task();
+    previousMillis0 = currentMillis;
+  }
+  if (currentMillis - previousMillis2 >= 1000)
+  {
+    BootSelTask();
+    previousMillis2 = currentMillis;
+  }
+}
 void loop1()
 {
   USBHost.task();

@@ -71,6 +71,7 @@ CH9329 *CH9329Client;
 #include "Adafruit_TinyUSB.h"
 
 #define USB_DEBUG 1
+#define USB_DEBUG_SENSITIVE 0
 
 struct CH9329CFG ch9329cfgs[CH9329COUNT] = {
     {
@@ -99,7 +100,7 @@ struct CH9329CFG ch9329cfgs[CH9329COUNT] = {
 // 定义通信结构体
 typedef struct TU_ATTR_PACKED
 {
-  uint8_t type;    // 0: mouse, 1: keyboard
+  uint8_t type;    // 0: mouse, 1: keyboard, 2:usb mount or unmount
   uint8_t data[8]; // HID report data (根据需要调整大小)
 } hid_report_t;
 
@@ -116,10 +117,22 @@ unsigned long previousMillis1 = 0;
 unsigned long previousMillis2 = 0;
 unsigned long previousMillis3 = 0;
 unsigned long currentMillis = 0;
+static unsigned long led_blink_interval = 1000;
+uint8_t led_blink_count = 0;
+
+static void process_usb_mount_report(hid_report_t *report)
+{
+  for (size_t i = 0; i < CH9329COUNT; i++)
+  {
+    CH9329Client->releaseAll(i);
+    CH9329Client->mouseRelease(i);
+  }
+
+  led_blink_interval = 200;
+}
 
 static void process_kbd_report(hid_keyboard_report_t const *report)
 {
-  static hid_keyboard_report_t prev_report = {0, 0, {0}};
   CH9329Client->press(current_status.active_screen,
                       report->modifier,
                       report->keycode[0],
@@ -128,16 +141,11 @@ static void process_kbd_report(hid_keyboard_report_t const *report)
                       report->keycode[3],
                       report->keycode[4],
                       report->keycode[5]
-
   );
-
-  prev_report = *report;
 }
 
 static void process_mouse_report(hid_mouse_report_t const *report)
 {
-  static hid_mouse_report_t prev_report = {0};
-
   judge_kvm_mode(CH9329Client->isUSBConnected(0),
                  CH9329Client->isUSBConnected(1),
                  report->x, report->y);
@@ -180,7 +188,6 @@ static void process_mouse_report(hid_mouse_report_t const *report)
 
   DBG_printf("\n");
 #endif
-  prev_report = *report;
 }
 // tuh_hid_mount_cb is executed when a new device is mounted.
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_report, uint16_t desc_len)
@@ -196,13 +203,13 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const *desc_re
     addKeyboard(dev_addr, instance);
   }
 
-  for (size_t i = 0; i < CH9329COUNT; i++)
-  {
-    CH9329Client->releaseAll(i);
-    CH9329Client->mouseRelease(i);
-  }
   const char *protocol_str[] = {"None", "Keyboard", "Mouse"};
   DBG_printf("Device with address %d, instance %d is a %s.\r\n", dev_addr, instance, protocol_str[itf_protocol]);
+
+  // notify core0 to blink
+  hid_report_t new_report;
+  new_report.type = 3;
+  queue_try_add(&report_queue, &new_report);
 
   // request to receive report
   // tuh_hid_report_received_cb() will be invoked when report is available
@@ -217,7 +224,7 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
 {
   uint8_t type = tuh_hid_interface_protocol(dev_addr, instance);
 
-#ifdef USB_DEBUG
+#if USB_DEBUG && USB_DEBUG_SENSITIVE
   // 打印接收到的数据长度和类型
   DBG_printf("Received Report: Type=%02X, Length=%u\r\n", type, len);
 
@@ -248,11 +255,11 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance)
 {
   removeKeyboard(dev_addr, instance);
-  for (size_t i = 0; i < CH9329COUNT; i++)
-  {
-    CH9329Client->releaseAll(i);
-    CH9329Client->mouseRelease(i);
-  }
+  // notify core0 to blink
+  hid_report_t new_report;
+  new_report.type = 3;
+  queue_try_add(&report_queue, &new_report);
+
   DBG_printf("Device with address %d, instance %d was unmounted.\r\n", dev_addr, instance);
 }
 
@@ -291,16 +298,14 @@ void setBoardLEDs_cb(KVM_MODE mode)
 
 void mouseFromLeftToRight_cb()
 {
-  DBG_println("mouseFromLeftToRight_cb");
   CH9329Client->mouseMoveAbs(SCREEN_LEFT,
-                             convert_to_abs_pos_x(MAX_SCREEN_WIDTH),
+                             convert_to_abs_pos_x(MAX_SCREEN_WIDTH) - 1,
                              convert_to_abs_pos_y(current_status.current_mouse_y),
                              0, 0);
 }
 
 void mouseFromRightToLeft_cb()
 {
-  DBG_println("mouseFromRightToLeft_cb");
   CH9329Client->mouseMoveAbs(SCREEN_RIGHT,
                              0,
                              convert_to_abs_pos_y(current_status.current_mouse_y),
@@ -310,6 +315,15 @@ void mouseFromRightToLeft_cb()
 // 新增任务：LED 闪烁任务
 void ledTask()
 {
+  if (led_blink_interval < 1000)
+  {
+    led_blink_count++;
+    if (led_blink_count >= 10)
+    {
+      led_blink_count = 0;
+      led_blink_interval = 1000;
+    }
+  }
   gpio_xor_mask(1U << LED_BUILTIN); // LED 开关
 }
 /**
@@ -365,8 +379,17 @@ void Core0SendSerialTask()
     case HID_ITF_PROTOCOL_MOUSE:
       process_mouse_report((hid_mouse_report_t const *)report.data);
       break;
+    case 3:
+      process_usb_mount_report(&report);
+      break;
     }
   }
+}
+void CH9329ClientStatusTask()
+{
+  judge_kvm_mode(CH9329Client->isUSBConnected(0),
+                 CH9329Client->isUSBConnected(1),
+                 0, 0);
 }
 
 /**
@@ -379,21 +402,36 @@ void setup1()
   Serial.flush();
 
   pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
-  pio_cfg.pin_dp = PIN_PIO_USB_HOST_DP;
+  pio_cfg.pin_dp = PIN_PIO_USB_HOST_DP2;
+  pio_cfg.pinout = PIO_USB_PINOUT_DPDM;
   USBHost.configure_pio_usb(1, &pio_cfg);
 
   // --- 配置第二个 Host 端口 (RHPort 2, GPIO 14/15) ---
   // 配置 USB 主机库的根端口 2
   // pio_usb_configuration_t pio_cfg_2 = PIO_USB_DEFAULT_CONFIG;
   // pio_cfg_2.pin_dp = PIN_PIO_USB_HOST_DP2;
-
   // USBHost.configure_pio_usb(2, &pio_cfg_2);
-  pio_usb_host_add_port(PIN_PIO_USB_HOST_DP2, PIO_USB_PINOUT_DPDM);
+
+  // pio_usb_host_add_port(PIN_PIO_USB_HOST_DP2, PIO_USB_PINOUT_DPDM);
 
   // run host stack on controller (rhport) 1
   // Note: For rp2040 pico-pio-usb, calling USBHost.begin() on core1 will have most of the
   // host bit-banging processing works done in core1 to free up core0 for other works
   USBHost.begin(1);
+  DBG_println("USB1 begin.");
+
+  // See https://github.com/sekigon-gonnoc/Pico-PIO-USB/discussions/72#discussioncomment-9456017
+  /**
+   * there is a function called pio_usb_host_add_port which adds a new host port.
+   * This can even be extendet to more ports if the value PIO_USB_ROOT_PORT_CNT (in file pio_usb_configuration.h) is changed (from 2 to 4 for example).
+   * pio_usb_host_add_port needs only 2 parameters (PIO_USB2_DP_PIN, PIO_USB_PINOUT_DPDM) and should be called after   tuh_init(BOARD_TUH_RHPORT).
+   * By the way, this has got nothing to do with further PIOs and state machines.
+   * Its internally done by changing pin settings on the fly (jmp pin, in pin, set pins, sideset pins).
+   * But this works only for host ports (for now).
+   */
+  pio_usb_host_add_port(PIN_PIO_USB_HOST_DP, PIO_USB_PINOUT_DPDM);
+  DBG_println("USB2 begin.");
+  Serial.flush();
 }
 
 //--------------------------------------------------------------------+
@@ -402,10 +440,6 @@ void setup1()
 void setup()
 {
   Serial.begin(115200);
-#if USB_DEBUG
-  while (!Serial)
-    delay(10); // wait for native usb
-#endif
   DBG_println("Serial inited.");
   Serial.flush();
 
@@ -413,10 +447,6 @@ void setup()
   uint32_t cpu_hz = clock_get_hz(clk_sys);
   if (cpu_hz != 120000000UL && cpu_hz != 240000000UL)
   {
-#if USB_DEBUG
-    while (!Serial)
-      delay(10); // wait for native usb
-#endif
     DBG_printf("Error: CPU Clock = %lu, PIO USB require CPU clock must be multiple of 120 Mhz\r\n", cpu_hz);
     DBG_println("Change your CPU Clock to either 120 or 240 Mhz in Menu->CPU Speed");
     while (1)
@@ -427,7 +457,7 @@ void setup()
   gpio_set_dir(LED_BUILTIN, GPIO_OUT);
 
   // 初始化队列
-  queue_init(&report_queue, sizeof(hid_report_t), 50); // 100项容量
+  queue_init(&report_queue, sizeof(hid_report_t), 100); // 100项容量
   DBG_println("Queue inited.");
   Serial.flush();
 
@@ -438,6 +468,10 @@ void setup()
   resetCH9329Task();
   DBG_println("CH9329Client reseted.");
   Serial.flush();
+
+  // wait until device mounted
+  // while (!USBDevice.mounted())
+  //   delay(1);
 }
 
 void loop()
@@ -453,13 +487,18 @@ void loop()
   if (currentMillis - previousMillis0 >= 500)
   {
     Serial2SendGetInfoTask();
-    ledTask();
     previousMillis0 = currentMillis;
   }
   if (currentMillis - previousMillis2 >= 1000)
   {
     BootSelTask();
+    CH9329ClientStatusTask();
     previousMillis2 = currentMillis;
+  }
+  if (currentMillis - previousMillis3 >= led_blink_interval)
+  {
+    ledTask();
+    previousMillis3 = currentMillis;
   }
 }
 void loop1()

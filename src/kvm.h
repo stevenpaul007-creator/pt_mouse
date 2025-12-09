@@ -109,8 +109,10 @@ static void judge_kvm_mode(bool leftUSBConnected,
     }
     else if (leftUSBConnected && rightUSBConnected)
     {
+#ifdef USB_DEBUG_SENSITIVE
         DBG_printf("leftUSBConnected = %02X, rightUSBConnected= %02X mouseRelX= %02X mouseRelY= %02X\r\n",
                    leftUSBConnected, rightUSBConnected, mouseRelX, mouseRelY);
+#endif
         if (mouseRelX >= 0x80)
         {
             current_status.current_mouse_x_in_dual_screen -= (uint8_t)(0 - mouseRelX);
@@ -171,20 +173,18 @@ static void judge_kvm_mode(bool leftUSBConnected,
     }
 
     setBoardLEDs_cb(current_status.mode);
-    // DBG_printf("current_mouse_x = %d, current_mouse_y= %d active_screen=%02X, mode=%02X \r\n",
-    //            current_status.current_mouse_x, current_status.current_mouse_y, current_status.active_screen, current_status.mode);
 }
 
 static uint16_t convert_to_abs_pos_x(uint16_t x)
 {
     uint16_t ret = 4096.0f * x / MAX_SCREEN_WIDTH;
-    DBG_printf("convert_to_abs_pos_x(%d)=%d\r\n", x, ret);
+    // DBG_printf("convert_to_abs_pos_x(%d)=%d\r\n", x, ret);
     return ret;
 }
 static uint16_t convert_to_abs_pos_y(uint16_t y)
 {
     uint16_t ret = 4096.0f * y / MAX_SCREEN_HEIGHT;
-    DBG_printf("convert_to_abs_pos_y(%d)=%d\r\n", y, ret);
+    // DBG_printf("convert_to_abs_pos_y(%d)=%d\r\n", y, ret);
     return ret;
 }
 

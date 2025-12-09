@@ -3,6 +3,10 @@
 A simple KVM with Pico and 2xCH9329 chips which offers auto switch screens by moving mouse.
 Something like deskhop[https://github.com/hrvach/deskhop]
 
+# Known Issues:
+* left usb host port is unuseable. I'm still working on it. But I don't know why.
+
+
 ## Hardware
 
 * 1x Pico(RP2040)

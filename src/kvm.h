@@ -177,13 +177,13 @@ static void judge_kvm_mode(bool leftUSBConnected,
 
 static uint16_t convert_to_abs_pos_x(uint16_t x)
 {
-    uint16_t ret = 4096.0f * x / MAX_SCREEN_WIDTH;
+    uint16_t ret = 4096.0f * x / MAX_SCREEN_WIDTH - 1;
     // DBG_printf("convert_to_abs_pos_x(%d)=%d\r\n", x, ret);
     return ret;
 }
 static uint16_t convert_to_abs_pos_y(uint16_t y)
 {
-    uint16_t ret = 4096.0f * y / MAX_SCREEN_HEIGHT;
+    uint16_t ret = 4096.0f * y / MAX_SCREEN_HEIGHT - 1;
     // DBG_printf("convert_to_abs_pos_y(%d)=%d\r\n", y, ret);
     return ret;
 }
